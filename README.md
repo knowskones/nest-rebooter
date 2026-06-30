@@ -1,209 +1,284 @@
-# Nest-Rebooter
+# Nest-Rebooter (Portable Edition)
 
-**Automate a scheduled network restart for Google Nest WiFi / Google WiFi using only software.**
-
-This python script uses the same Google cloud API the Google Home app uses to restart your mesh network (router and all access points) on a schedule you can set yourself. It is mainly built with a headless Linux machine in mind, but should also work on any Linux setup.
+**Automated scheduled restart for Google Nest WiFi / Google WiFi — cross-platform, single-file implementation.**
 
 ---
 
-## The problem
+## Credit
 
-A lot of Google Nest WiFi and Google WiFi network users suffer from a well-known internet speed bug somewhere in the firmware of the Nest Wifi. For a lot of users, over the course of 1–3 days, speeds drop from near Gigabit speeds (or whatever is the max speed allowed by their internet provider) to flcutating and inconsistent speeds. The only fix seems to be either manually restarting the network or performing a Network Speed Test in the Google Home app. Google has known about this bug since at least [2021 as per this nest community thread](https://www.googlenestcommunity.com/t5/Nest-Wifi/Scheduled-network-restart/m-p/58814) but has never added a scheduled restart feature. This is probably also because they have stopped all support for Nest/Google Wifi.
+This project is based on the original work by:
 
-This script aims to fix this bug by allowing you to restart your network remotely and automaticaly at any point in time from any (always-on) linux machine.
+**joep1000 / nest-rebooter**  
+https://github.com/joep1000/nest-rebooter
 
-## What it aims to do practically
+The core concept, API method, and authentication approach originate from that project.  
+This version is a complete rewrite focused on portability, simplicity, and production reliability.
 
-- **A Full network restart** — the script will reboot the main router and all mesh points connected to it simultaneously. This action is identical to tapping "Restart network" in the Google Home app
-- **Scheduled via systemd** — It automatically creates a systemd action that runs automatically at 3:00 AM (this is configurable in the script itself though, you can also set it to any other time)
-- **Post-reboot speed test** — after the reboot, just to be safe, it runs a WAN speed test. This automatically occurs 10 minutes after the restart.
-- **One-time browser setup** — You have to authenticate once via a browser cookie to make it work. Once that's done, it's fully automated.
+---
 
-## How the script works
+## Overview
 
-I have painstakingly checked and reverse-engineered the Google Home APK to see how the API calls the Google/Nest Wifi to do various commands. Interestingly, the Google Home app doesn't use the router's local API to restart the network. It instead calls a **cloud REST API** on `googlehomefoyer-pa.googleapis.com`:
+This script automates the restart of a Google Nest WiFi / Google WiFi network by calling the same Google cloud API used by the Google Home application.
+
+It is implemented as a **single Python file** and runs on:
+
+- Windows
+- macOS
+- Linux
+
+The script is designed to run unattended via the native scheduler of each operating system.
+
+---
+
+## Problem
+
+Google Nest WiFi and Google WiFi systems are known to degrade in performance over time:
+
+- Throughput drops after 1–3 days
+- Latency and consistency degrade
+- Recovery typically requires manual restart
+
+There is no native scheduling feature provided by Google.
+
+This script provides a reliable automated workaround.
+
+---
+
+## Functionality
+
+- Performs a full network restart (router and all access points)
+- Uses official Google Home backend infrastructure
+- Requires one-time authentication
+- Runs unattended on a schedule
+- Includes safety checks and logging
+- Requires no additional services or background processes
+
+---
+
+## Key Adjustments
+
+| Area | Original | Portable Version |
+|------|----------|----------------|
+| Platform | Linux-focused | Cross-platform |
+| Installation | Bash installer | Single Python file |
+| Scheduling | systemd | Native OS schedulers |
+| Setup | Manual cookie extraction | Automated browser login |
+| File layout | Multiple files | Self-contained |
+| Logging | System directories | Local file |
+| Execution | Requires arguments | Runs with no arguments |
+| Reliability | Basic | Locking, validation, atomic writes |
+| Safety | Minimal | SSID verification, dry-run |
+
+---
+
+## How It Works
+
+The script uses the same backend API used by the Google Home app.
+
+### Flow
 
 ```
-POST /v2/groups/{group_id}/reboot
-```
-
-This in return sends a `base.reboot` command to every access point in the mesh. The auth chain works as follows:
-
-```
-Browser cookie (one-time)
-    ↓  gpsoauth.exchange_token()
-Master token (long-lived, stored locally)
-    ↓  gpsoauth.perform_oauth()
-Access token (refreshed automatically each run)
+User login (browser)
     ↓
-Google Home Foyer REST API → full network restart
+OAuth cookie (oauth_token)
+    ↓
+gpsoauth.exchange_token()
+    ↓
+Master token (stored locally)
+    ↓
+gpsoauth.perform_oauth()
+    ↓
+Access token (generated per run)
+    ↓
+Google Home API
+    ↓
+Network reboot
 ```
+
+### API Endpoint
+
+```
+POST https://googlehomefoyer-pa.googleapis.com/v2/groups/{system_id}/reboot
+```
+
+---
 
 ## Requirements
 
-- Python 3.8+
-- A Linux machine on the same network as your router and AP/mesh points
-- The Google account that **owns** the WiFi network (home owner in Google Home, otherwise this script won't work)
-- A browser (any device) for one-time authentication
+- Python 3.8 or newer
+- Google account that **owns the WiFi network**
+- Internet connection
+- Local browser (for initial setup only)
+
+---
 
 ## Installation
 
-### Quick install
+Install required dependencies:
 
 ```bash
-git clone https://github.com/joep1000/nest-rebooter.git
-cd nest-rebooter
-bash install.sh
+pip install gpsoauth playwright
+python -m playwright install chromium
 ```
 
-### Manual install
+No further installation is required.
+
+---
+
+## Setup
+
+Run once:
 
 ```bash
-pip install gpsoauth requests grpcio
-# Download nest_rebooter.py and run it directly
+python nest_rebooter_portable_v3.py setup
 ```
 
-## Setup (5 minutes, one-time)
+### Setup Process
 
-```bash
-nest-rebooter setup
+1. A browser window opens automatically
+2. Log in with your Google Home account
+3. Script captures authentication token
+4. Script attempts to identify your network
+5. Configuration is saved locally
+
+### Files Created
+
+All files are stored in the same directory as the script:
+
+```
+config.json
+nest-rebooter.log
+nest-rebooter.lock
+android_id.txt
+browser-profile/
 ```
 
-The script will guide you through:
-
-1. **Enter the WiFi owner's email** (the Google account that owns the home)
-2. **Get the OAuth cookie:**
-   - Open `https://accounts.google.com/EmbeddedSetup` in any browser
-   - Now Open DevTools (press F12 in most browsers) and go to → Application → Cookies. Keep this open for the rest of this process.
-   - Log in with the WiFi owner's Google account
-   - Click "I agree" (the page may hang after you click agree. This is normal behavior.)
-   - You should now see a cookie showing up in your DevTools window. Open this cookie tab and find the  `oauth_token` value. Copy the `oauth_token` value (starts with `oauth2_4/`) to your clipboard. 
-3. **Paste the oauth token** into the terminal The `oauth_token` cookie is **single-use** and expires very fast within minutes, so make sure to be quick with this.
-
-The script will then authenticate, discover your network setup, and save the configuration. By default, it will run automatically at 3 AM and restart your network.
+---
 
 ## Usage
 
-```bash
-# Test that everything works (this won't reboot your network, but will simply test if the endpoint works.)
-nest-rebooter test
-
-# Restart the network immediately
-nest-rebooter reboot
-
-# Run a speed test
-nest-rebooter speedtest
-
-# Install the daily 3 AM timer
-nest-rebooter install
-
-# Check status and next scheduled reboot
-nest-rebooter status
-
-# Remove the timer
-nest-rebooter uninstall
-```
-
-### Changing the reboot time
-
-To change the reboot time, edit this file: `~/.config/nest-rebooter/config.json`:
-
-```json
-{
-  "reboot_time": "04:30"
-}
-```
-
-After that, reinstall the timer:
+### Normal execution
 
 ```bash
-nest-rebooter install
+python nest_rebooter_portable_v3.py
 ```
 
-## A succesful reboot looks like this:
+- No arguments required
+- Default behaviour is a network reboot
 
-```
-$ nest-rebooter reboot
-2026-03-09 19:20:10 [INFO] Network: MyNetwork
-2026-03-09 19:20:10 [INFO] Authenticating...
-2026-03-09 19:20:10 [INFO] Auth OK.
-2026-03-09 19:20:10 [INFO] Method 1: REST reboot...
-2026-03-09 19:20:11 [INFO] REST reboot accepted! Network will restart.
-2026-03-09 19:20:11 [INFO] Waiting for internet (180s timeout)...
-2026-03-09 19:20:56 [INFO] Internet back after ~24s.
-2026-03-09 19:30:56 [INFO] Starting WAN speed test...
-2026-03-09 19:31:30 [INFO] Speed test results: ↓ 342 Mbps / ↑ 28 Mbps
-2026-03-09 19:31:30 [INFO] Network restart complete.
-```
+---
 
-Each access point receives its own `base.reboot` command with `code: SUCCESS`.
+### Test without reboot
 
-## Supported Devices
-
-The script is confirming working at my home setup, which has the following devices:
-- Nest Wifi Router + Nest Wifi Points
-- Google Wifi Points
-- Mixed Nest Wifi + Google Wifi mesh networks
-
-It should also also work with the Nest Wifi Pro (Wi-Fi 6E) because it seems to use the same Foyer API, but I haven't tested this.
-
-## Configuration
-
-Config is stored at `~/.config/nest-rebooter/config.json`:
-
-| Key | Description |
-|-----|-------------|
-| `master_token` | Long-lived Google auth token |
-| `email` | Google account email |
-| `system_id` | WiFi network group ID |
-| `system_name` | Network name |
-| `reboot_time` | Daily reboot time (HH:MM) |
-| `speedtest_delay_minutes` | Wait time before speed test (default: 10) |
-| `last_reboot` | Timestamp of last reboot |
-| `last_speed_test` | Last speed test results |
-
-## Troubleshooting
-
-### "Could not get master token"
-- The `oauth_token` cookie is **single-use** and expires very fast within minutes
-- You must paste it into the terminal immediately after copying
-- Make sure the value starts with `oauth2_4/`
-- Repeat the browser flow to get a fresh one
-
-### "No networks found"
-- Make sure you logged in with the **home owner's** Google account, not a shared member
-- The account must be listed as an admin/owner in Google Home → Settings → Household
-
-### "Auth failed"
-- The master token can expire (rare), or the google endpoint changed (unlikely but possible, Google has stopped updating Google Wifi a while ago.) If the master token expired, you can run `nest-rebooter setup --force` to get a new cookie and repeat the process from the setup above.
-
-### Timer doesn't fire when not logged in
 ```bash
-sudo loginctl enable-linger $USER
+python nest_rebooter_portable_v3.py test
 ```
-This allows systemd user timers to run without an active login session. It's essential for headless machines.
 
-## Security
+---
 
-- Your Google password is **never stored** by this script. The only thing stored on your machine is a master token derived from the one-time browser cookie you obtained during the setup process.
-- The master token is stored in `~/.config/nest-rebooter/config.json` with `600` permissions (owner read/write only.)
-- The reboot command goes through Google's cloud API (same as the Google Home app.) It is not a local exploit.
+### View status
 
-## Background
+```bash
+python nest_rebooter_portable_v3.py status
+```
 
-This project was born from [this 270-reply thread](https://www.googlenestcommunity.com/t5/Nest-Wifi/Scheduled-network-restart/m-p/58814) on the Google Nest Community forum, where users have been requesting a scheduled restart feature since December 2021. Google just never added it, so I said fine... I'll do it myself
+---
 
-The auth flow was pieced together from:
-- [glocaltokens](https://github.com/leikoilja/glocaltokens) — Google Home local auth token library
-- [googlewifi-api](https://github.com/djtimca/googlewifi-api) — Google WiFi API wrapper (source of the Foyer REST endpoints)
-- [GHLocalApi](https://rithvikvibhu.github.io/GHLocalApi/) — Unofficial Google Home local API docs
-- [julianpitt's gist](https://gist.github.com/julianpitt/94774e74d36a46f9ec10ddce13cfd423) — EmbeddedSetup cookie → master token method
-- Reverse engineering of the Google Home Android APK (decompiled via JADX) which revealed the cloud gRPC `UtilityService.RebootGroupWhenUpdateReady` path
+### Dry run
 
-## License
+```bash
+NEST_REBOOTER_DRY_RUN=1 python nest_rebooter_portable_v3.py
+```
 
-MIT — do whatever you want with it.
+No network action is performed.
 
-## Contributing
+---
 
-Issues and PRs are always welcome. If you have a Nest Wifi Pro and can test if it works with this setup too, that would be especially helpful.
+## Scheduling
+
+### Windows (Task Scheduler)
+
+**Program:**
+
+```text
+py
+```
+
+**Arguments:**
+
+```text
+"C:\path\to\nest_rebooter_portable_v3.py"
+```
+
+No additional parameters required.
+
+---
+
+### Linux (cron)
+
+```bash
+crontab -e
+```
+
+Example:
+
+```bash
+0 3 * * * /usr/bin/python3 /path/nest_rebooter_portable_v3.py
+```
+
+---
+
+### macOS (cron or launchd)
+
+Simple cron example:
+
+```bash
+0 3 * * * /usr/bin/python3 /path/nest_rebooter_portable_v3.py
+```
+
+---
+
+## Safety Features
+
+- Ensures only one instance runs at a time
+- Optional check to confirm correct WiFi network before reboot
+- Dry-run capability for testing
+- Secure log output (tokens are redacted)
+- Atomic configuration writes to prevent corruption
+
+---
+
+## Security Considerations
+
+- The script does not store your Google password
+- A long-lived authentication token is stored locally
+- Protect the script directory with appropriate filesystem permissions
+
+---
+
+## Limitations
+
+- Uses an undocumented Google API
+- May break if Google changes backend behaviour
+- Requires initial browser authentication
+- Autodiscovery may require manual confirmation in some cases
+
+---
+
+## Summary
+
+This version provides:
+
+- A portable implementation of the original concept
+- Reliable unattended execution across all operating systems
+- Simplified setup and operation
+- Production-grade safeguards for long-term use
+
+---
+
+If further extension is required, this architecture supports:
+
+- Post-reboot validation (speed test)
+- Multi-network support
+- Notification integrations
+- Packaging as a standalone executable
