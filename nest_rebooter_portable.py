@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
 """
-nest_rebooter_portable_v3.py
+nest_rebooter_portable.py
 
-Version 3.1 reliability-hardened portable Google/Nest WiFi network rebooter.
+Version 3.1.3 reliability-hardened portable Google/Nest WiFi network rebooter.
 
 First run:
-  py nest_rebooter_portable_v3.py setup
+  py nest_rebooter_portable.py setup
 
 Scheduled/default run:
-  py nest_rebooter_portable_v3.py
+  py nest_rebooter_portable.py
 
 Reliability hardening in 3.1:
   - PID-aware stale lock detection and cleanup
@@ -41,6 +41,7 @@ import tempfile
 import time
 import urllib.error
 import urllib.request
+import uuid
 import xml.sax.saxutils
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
@@ -48,7 +49,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 APP_NAME = "nest-rebooter"
-SCRIPT_VERSION = "3.1.0"
+SCRIPT_VERSION = "3.1.3"
 CONFIG_SCHEMA_VERSION = 1
 
 FOYER_BASE = "https://googlehomefoyer-pa.googleapis.com"
@@ -79,6 +80,20 @@ REQUIRED_MODULES = {"gpsoauth": "gpsoauth>=1.0.2", "playwright": "playwright>=1.
 RETRYABLE_HTTP_STATUSES = {0, 408, 409, 425, 429, 500, 502, 503, 504}
 AUTH_RETRY_STATUSES = {401, 403}
 
+RUNTIME_MASTER_TOKEN: Optional[str] = None
+_CACHED_ACCESS_TOKEN: Optional[str] = None
+
+ASCII_LOGO = r"""
+============================================================
+ _   _           _     ____      _                 _            
+| \ | | ___  ___| |_  |  _ \ ___| |__   ___   ___ | |_ ___ _ __ 
+|  \| |/ _ \/ __| __| | |_) / _ \ '_ \ / _ \ / _ \| __/ _ \ '__|
+| |\  |  __/\__ \ |_  |  _ <  __/ |_) | (_) | (_) | ||  __/ |   
+|_| \_|\___||___/\__| |_| \_\___|_.__/ \___/ \___/ \__\___|_|   
+
+Portable Google/Nest WiFi Rebooter
+============================================================
+"""
 DISCOVERY_ENDPOINTS = [
     "/v2/groups?prettyPrint=false",
     "/v2/systems?prettyPrint=false",
@@ -297,6 +312,79 @@ def dry_run_enabled() -> bool:
     return os.environ.get("NEST_REBOOTER_DRY_RUN", "").strip().lower() in {"1", "true", "yes", "on"}
 
 
+def is_dry_run(args: argparse.Namespace) -> bool:
+    return bool(getattr(args, "dry_run", False) or dry_run_enabled())
+
+
+def print_logo() -> None:
+    print(ASCII_LOGO)
+
+
+def prompt_text(prompt: str, default: Optional[str] = None) -> str:
+    suffix = f" [{default}]" if default not in (None, "") else ""
+    return input(f"{prompt}{suffix}: ").strip() or (default or "")
+
+
+def countdown_sleep(seconds: int, logger: logging.Logger, reason: str, update_every: int = 15) -> None:
+    seconds = max(0, int(seconds))
+    if seconds <= 0:
+        return
+    logger.info("%s Waiting %s seconds.", reason, seconds)
+    remaining = seconds
+    while remaining > 0:
+        step = min(update_every, remaining)
+        time.sleep(step)
+        remaining -= step
+        if remaining > 0:
+            logger.info("%s Still waiting... %s seconds remaining.", reason, remaining)
+    logger.info("%s Wait complete.", reason)
+
+
+def run_cmd_progress(args: List[str], logger: logging.Logger, timeout: int = 900, progress_message: str = "Command still running") -> Tuple[int, str, str]:
+    """Run a command and print periodic progress so long installs do not look frozen."""
+    start = monotonic()
+    try:
+        proc = subprocess.Popen(args, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        last_notice = 0.0
+        while proc.poll() is None:
+            run_for = elapsed(start)
+            if run_for - last_notice >= 15:
+                logger.info("%s (%ss elapsed).", progress_message, round(run_for))
+                last_notice = run_for
+            if run_for > timeout:
+                proc.kill()
+                out, err = proc.communicate(timeout=10)
+                return 1, out or "", (err or "") + f"\nTimed out after {timeout} seconds."
+            time.sleep(1)
+        out, err = proc.communicate()
+        return proc.returncode, out or "", err or ""
+    except Exception as exc:
+        return 1, "", str(exc)
+
+
+def token_storage_warning(config_path: Path) -> str:
+    return f"""
+IMPORTANT SECURITY WARNING
+This script can save a long-lived Google master token in:
+  {config_path}
+
+This is convenient, but it is not fully secure. Anyone who can read this folder may be able
+to reuse the token. Keep this script folder private, hidden where practical, and never upload
+config.json, browser-profile, logs, or token files to GitHub, shared OneDrive folders, email,
+or public support tickets.
+
+Saving the token is required for unattended scheduled reboots. If you do not save it, this
+setup can only be used for the current run. The next script start will require setup again.
+""".strip()
+
+
+def apply_runtime_token_if_present(cfg: AppConfig) -> AppConfig:
+    global RUNTIME_MASTER_TOKEN
+    if not cfg.master_token and RUNTIME_MASTER_TOKEN:
+        cfg.master_token = RUNTIME_MASTER_TOKEN
+    return cfg
+
+
 def yes_no(prompt: str, default: bool) -> bool:
     suffix = "[Y/n]" if default else "[y/N]"
     while True:
@@ -307,7 +395,7 @@ def yes_no(prompt: str, default: bool) -> bool:
             return True
         if answer in {"n", "no"}:
             return False
-        print("Please answer yes or no.")
+        print("Please answer yes or no. Type y or n, then press Enter.")
 
 
 def validate_time(value: str) -> None:
@@ -317,12 +405,12 @@ def validate_time(value: str) -> None:
 
 def prompt_time(default: str = DEFAULT_SCHEDULE_TIME) -> str:
     while True:
-        value = input(f"Daily reboot time HH:MM [{default}]: ").strip() or default
+        value = input(f"Daily reboot time in 24-hour HH:MM format [{default}]: ").strip() or default
         try:
             validate_time(value)
             return value
         except ScheduleError:
-            print("Use 24-hour HH:MM format, for example 03:00.")
+            print("Use 24-hour HH:MM format, for example 03:00 for 3:00 AM.")
 
 
 def atomic_write_json(path: Path, data: Dict[str, Any]) -> None:
@@ -392,23 +480,34 @@ def process_exists(pid: int) -> bool:
 
 @contextlib.contextmanager
 def single_instance_lock(p: AppPaths, logger: logging.Logger):
-    if p.lock_path.exists():
+    """Acquire a PID-aware lock and only delete it if this process owns it."""
+    token = uuid.uuid4().hex
+    payload = {"pid": os.getpid(), "token": token, "started_at": now_iso()}
+
+    while True:
         try:
-            payload = json.loads(p.lock_path.read_text(encoding="utf-8"))
-            old_pid = int(payload.get("pid", 0))
-            if old_pid and process_exists(old_pid):
-                raise NestRebooterError(f"Another instance is running with PID {old_pid}: {p.lock_path}")
-            logger.warning("Removing stale lock file: %s", p.lock_path)
-            p.lock_path.unlink(missing_ok=True)
-        except json.JSONDecodeError:
-            logger.warning("Removing unreadable lock file: %s", p.lock_path)
-            p.lock_path.unlink(missing_ok=True)
-    p.lock_path.write_text(json.dumps({"pid": os.getpid(), "started_at": now_iso()}), encoding="utf-8")
+            with p.lock_path.open("x", encoding="utf-8") as fh:
+                json.dump(payload, fh)
+            break
+        except FileExistsError:
+            try:
+                existing = json.loads(p.lock_path.read_text(encoding="utf-8"))
+                old_pid = int(existing.get("pid", 0))
+                if old_pid and process_exists(old_pid):
+                    raise NestRebooterError(f"Another instance is running with PID {old_pid}: {p.lock_path}")
+                logger.warning("Removing stale lock file: %s", p.lock_path)
+                p.lock_path.unlink(missing_ok=True)
+            except json.JSONDecodeError:
+                logger.warning("Removing unreadable lock file: %s", p.lock_path)
+                p.lock_path.unlink(missing_ok=True)
+
     try:
         yield
     finally:
-        with contextlib.suppress(FileNotFoundError):
-            p.lock_path.unlink()
+        with contextlib.suppress(Exception):
+            current = json.loads(p.lock_path.read_text(encoding="utf-8"))
+            if current.get("pid") == os.getpid() and current.get("token") == token:
+                p.lock_path.unlink()
 
 
 def current_wifi_ssid() -> Optional[str]:
@@ -461,14 +560,25 @@ def ensure_dependencies(logger: logging.Logger, auto_install: bool) -> None:
     if missing:
         if not auto_install:
             raise DependencyError("Missing dependencies: " + ", ".join(missing))
-        logger.info("Installing missing dependencies: %s", ", ".join(missing))
-        code, out, err = run_cmd([sys.executable, "-m", "pip", "install", *missing], timeout=900)
+        logger.info("Installing missing Python dependencies: %s", ", ".join(missing))
+        logger.info("This may take several minutes on slower connections. Progress updates will print every 15 seconds.")
+        code, out, err = run_cmd_progress(
+            [sys.executable, "-m", "pip", "install", *missing],
+            logger,
+            timeout=900,
+            progress_message="Dependency installation still running",
+        )
         if code != 0:
             raise DependencyError(err or out)
         importlib.invalidate_caches()
     if module_available("playwright"):
-        logger.info("Ensuring Playwright Chromium is installed.")
-        code, out, err = run_cmd([sys.executable, "-m", "playwright", "install", "chromium"], timeout=900)
+        logger.info("Ensuring Playwright Chromium browser is installed. This can take 3-5 minutes on first setup.")
+        code, out, err = run_cmd_progress(
+            [sys.executable, "-m", "playwright", "install", "chromium"],
+            logger,
+            timeout=1200,
+            progress_message="Playwright Chromium installation still running",
+        )
         if code != 0:
             raise DependencyError(err or out)
 
@@ -508,7 +618,12 @@ def browser_get_oauth_cookie(p: AppPaths, logger: logging.Logger, timeout_second
             page = context.pages[0] if context.pages else context.new_page()
             page.goto(EMBEDDED_SETUP_URL, wait_until="domcontentloaded")
             deadline = time.time() + timeout_seconds
+            last_notice = 0
             while time.time() < deadline:
+                remaining = int(deadline - time.time())
+                if remaining // 15 != last_notice // 15:
+                    logger.info("Waiting for Google login token... %s seconds remaining.", max(0, remaining))
+                    last_notice = remaining
                 for cookie in context.cookies(["https://accounts.google.com", "https://google.com"]):
                     if cookie.get("name") == "oauth_token" and cookie.get("value"):
                         logger.info("oauth_token detected; closing browser.")
@@ -520,21 +635,45 @@ def browser_get_oauth_cookie(p: AppPaths, logger: logging.Logger, timeout_second
     raise ApiError("Timed out waiting for oauth_token.")
 
 
-def exchange_cookie_for_master_token(email: str, oauth_token: str, android_id: str) -> str:
-    response = require_gpsoauth().exchange_token(email, oauth_token, android_id)
-    if not isinstance(response, dict) or "Token" not in response:
-        raise ApiError(f"Could not obtain master token. Response: {type(response)}")
-    return str(response["Token"])
+def exchange_cookie_for_master_token(email: str, oauth_token: str, android_id: str, logger: Optional[logging.Logger] = None) -> str:
+    last_error: Optional[Exception] = None
+    for attempt in range(1, 4):
+        try:
+            response = require_gpsoauth().exchange_token(email, oauth_token, android_id)
+            if not isinstance(response, dict) or "Token" not in response:
+                raise ApiError(f"Could not obtain master token. Response: {type(response)}")
+            return str(response["Token"])
+        except Exception as exc:
+            last_error = exc
+            if logger:
+                logger.warning("Master token exchange failed on attempt %s/3: %s", attempt, exc)
+            if attempt < 3:
+                countdown_sleep(int(DEFAULT_HTTP_BACKOFF_SECONDS * (2 ** (attempt - 1))), logger or logging.getLogger(APP_NAME), "Retrying master token exchange", update_every=5)
+    raise ApiError(f"Could not obtain master token after retries: {last_error}")
 
 
-def get_access_token(cfg: AppConfig) -> str:
-    response = require_gpsoauth().perform_oauth(
-        cfg.email, cfg.master_token, cfg.android_id,
-        app=GOOGLE_HOME_APP, service=GOOGLE_HOME_SERVICE, client_sig=GOOGLE_HOME_CLIENT_SIG,
-    )
-    if not isinstance(response, dict) or "Auth" not in response:
-        raise ApiError(f"Could not obtain access token. Response: {type(response)}")
-    return str(response["Auth"])
+def get_access_token(cfg: AppConfig, force_refresh: bool = False, logger: Optional[logging.Logger] = None) -> str:
+    global _CACHED_ACCESS_TOKEN
+    if _CACHED_ACCESS_TOKEN and not force_refresh:
+        return _CACHED_ACCESS_TOKEN
+    last_error: Optional[Exception] = None
+    for attempt in range(1, 4):
+        try:
+            response = require_gpsoauth().perform_oauth(
+                cfg.email, cfg.master_token, cfg.android_id,
+                app=GOOGLE_HOME_APP, service=GOOGLE_HOME_SERVICE, client_sig=GOOGLE_HOME_CLIENT_SIG,
+            )
+            if not isinstance(response, dict) or "Auth" not in response:
+                raise ApiError(f"Could not obtain access token. Response: {type(response)}")
+            _CACHED_ACCESS_TOKEN = str(response["Auth"])
+            return _CACHED_ACCESS_TOKEN
+        except Exception as exc:
+            last_error = exc
+            if logger:
+                logger.warning("Access token request failed on attempt %s/3: %s", attempt, exc)
+            if attempt < 3:
+                countdown_sleep(int(DEFAULT_HTTP_BACKOFF_SECONDS * (2 ** (attempt - 1))), logger or logging.getLogger(APP_NAME), "Retrying access token request", update_every=5)
+    raise ApiError(f"Could not obtain access token after retries: {last_error}")
 
 
 def base_http_request(method: str, url: str, token: Optional[str] = None, body: Optional[Dict[str, Any]] = None, timeout: int = DEFAULT_HTTP_TIMEOUT_SECONDS) -> Tuple[int, str, float]:
@@ -572,12 +711,12 @@ def http_request_with_retry(method: str, url: str, token: Optional[str] = None, 
 
 def authenticated_request(cfg: AppConfig, method: str, endpoint_or_url: str, body: Optional[Dict[str, Any]] = None, logger: Optional[logging.Logger] = None) -> Tuple[int, str, float]:
     url = endpoint_or_url if endpoint_or_url.startswith("http") else FOYER_BASE + endpoint_or_url
-    token = get_access_token(cfg)
+    token = get_access_token(cfg, logger=logger)
     status, text, latency = http_request_with_retry(method, url, token=token, body=body, logger=logger)
     if status in AUTH_RETRY_STATUSES:
         if logger:
             logger.warning("Auth failure HTTP %s; refreshing token and retrying once.", status)
-        token = get_access_token(cfg)
+        token = get_access_token(cfg, force_refresh=True, logger=logger)
         status, text, latency2 = http_request_with_retry(method, url, token=token, body=body, logger=logger, attempts=2)
         latency = round(latency + latency2, 3)
     return status, text, latency
@@ -637,11 +776,15 @@ def wait_for_network_recovery(logger: logging.Logger, timeout_seconds: int, inte
     start = monotonic()
     deadline = time.time() + timeout_seconds
     last_checks: Dict[str, bool] = {}
+    attempt = 0
     while time.time() < deadline:
+        attempt += 1
         ok, last_checks = network_recovered(logger)
+        remaining = max(0, int(deadline - time.time()))
+        logger.info("Network recovery check %s: ok=%s remaining=%ss checks=%s", attempt, ok, remaining, last_checks)
         if ok:
             return True, last_checks, elapsed(start)
-        time.sleep(interval_seconds)
+        countdown_sleep(interval_seconds, logger, "Waiting before next network recovery check", update_every=max(5, interval_seconds))
     logger.warning("Network recovery was not fully confirmed before timeout. Last checks: %s", last_checks)
     return False, last_checks, elapsed(start)
 
@@ -670,6 +813,33 @@ def candidate_id(obj: Dict[str, Any]) -> Optional[str]:
     return None
 
 
+def select_candidate_by_ssid(candidates: List[Dict[str, str]], ssid: Optional[str]) -> Optional[Dict[str, str]]:
+    """Conservatively select a discovery candidate by SSID.
+
+    Order: exact raw match, stripped/casefold exact match, then bounded token match.
+    If more than one candidate matches at any level, return None and require manual selection.
+    """
+    if not ssid:
+        return None
+    raw = ssid.strip()
+    norm = raw.casefold()
+
+    exact_raw = [c for c in candidates if c.get("name", "") == ssid]
+    if len(exact_raw) == 1:
+        return exact_raw[0]
+
+    exact_norm = [c for c in candidates if c.get("name", "").casefold().strip() == norm]
+    if len(exact_norm) == 1:
+        return exact_norm[0]
+
+    bounded_pattern = re.compile(rf"(^|[^\w]){re.escape(norm)}([^\w]|$)", re.I)
+    bounded = [c for c in candidates if bounded_pattern.search(c.get("name", "").casefold())]
+    if len(bounded) == 1:
+        return bounded[0]
+
+    return None
+
+
 def discover_system_id(cfg: AppConfig, ssid: Optional[str], logger: Optional[logging.Logger] = None) -> Tuple[Optional[str], Optional[str], List[Dict[str, str]]]:
     candidates: List[Dict[str, str]] = []
     seen = set()
@@ -689,11 +859,9 @@ def discover_system_id(cfg: AppConfig, ssid: Optional[str], logger: Optional[log
                 candidates.append({"id": cid, "name": name or "(unnamed candidate)", "source": endpoint})
     if not candidates:
         return None, None, []
-    if ssid:
-        norm = ssid.casefold().strip()
-        matches = [c for c in candidates if norm and norm in c["name"].casefold()]
-        if len(matches) == 1:
-            return matches[0]["id"], matches[0]["name"], candidates
+    selected = select_candidate_by_ssid(candidates, ssid)
+    if selected:
+        return selected["id"], selected["name"], candidates
     if len(candidates) == 1:
         return candidates[0]["id"], candidates[0]["name"], candidates
     return None, None, candidates
@@ -880,10 +1048,15 @@ def install_linux_cron_schedule(p: AppPaths, schedule_time: str, logger: logging
     if shutil.which("crontab") is None:
         raise ScheduleError("crontab not found.")
     hour, minute = schedule_time.split(":")
-    cron_line = f'{int(minute)} {int(hour)} * * * "{Path(sys.executable).resolve()}" "{p.script_path}" >> "{p.script_dir / "nest-rebooter.schedule.log"}" 2>&1'
+    schedule_log = p.script_dir / "nest-rebooter.schedule.log"
+    cron_line = f'{int(minute)} {int(hour)} * * * "{Path(sys.executable).resolve()}" "{p.script_path}" >> "{schedule_log}" 2>&1'
     code, existing, err = run_cmd(["crontab", "-l"], timeout=30)
     if code != 0:
-        existing = "" if "no crontab" in err.lower() else existing
+        combined = (existing + "\n" + err).lower()
+        if "no crontab" in combined or "no crontab for" in combined:
+            existing = ""
+        else:
+            raise ScheduleError("Could not read existing crontab: " + (err or existing))
     new_cron = remove_marked(existing).rstrip()
     new_cron = (new_cron + "\n" if new_cron else "") + f"{CRON_BEGIN}\n{cron_line}\n{CRON_END}\n"
     proc = subprocess.run(["crontab", "-"], input=new_cron, text=True, capture_output=True, timeout=30)
@@ -891,14 +1064,32 @@ def install_linux_cron_schedule(p: AppPaths, schedule_time: str, logger: logging
         raise ScheduleError(proc.stderr or proc.stdout)
     logger.info("Linux cron schedule installed daily at %s.", schedule_time)
 
-
 def install_macos_schedule(p: AppPaths, schedule_time: str, logger: logging.Logger) -> None:
     hour, minute = [int(x) for x in schedule_time.split(":")]
     plist = Path.home() / "Library" / "LaunchAgents" / f"{MACOS_PLIST_LABEL}.plist"
     plist.parent.mkdir(parents=True, exist_ok=True)
     content = f"""<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0"><dict><key>Label</key><string>{xml.sax.saxutils.escape(MACOS_PLIST_LABEL)}</string><key>ProgramArguments</key><array><string>{xml.sax.saxutils.escape(str(Path(sys.executable).resolve()))}</string><string>{xml.sax.saxutils.escape(str(p.script_path))}</string></array><key>StartCalendarInterval</key><dict><key>Hour</key><integer>{hour}</integer><key>Minute</key><integer>{minute}</integer></dict><key>StandardOutPath</key><string>{xml.sax.saxutils.escape(str(p.script_dir / 'nest-rebooter.schedule.log'))}</string><key>StandardErrorPath</key><string>{xml.sax.saxutils.escape(str(p.script_dir / 'nest-rebooter.schedule.err.log'))}</string></dict></plist>
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>{xml.sax.saxutils.escape(MACOS_PLIST_LABEL)}</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>{xml.sax.saxutils.escape(str(Path(sys.executable).resolve()))}</string>
+    <string>{xml.sax.saxutils.escape(str(p.script_path))}</string>
+  </array>
+  <key>StartCalendarInterval</key>
+  <dict>
+    <key>Hour</key><integer>{hour}</integer>
+    <key>Minute</key><integer>{minute}</integer>
+  </dict>
+  <key>StandardOutPath</key>
+  <string>{xml.sax.saxutils.escape(str(p.script_dir / 'nest-rebooter.schedule.log'))}</string>
+  <key>StandardErrorPath</key>
+  <string>{xml.sax.saxutils.escape(str(p.script_dir / 'nest-rebooter.schedule.err.log'))}</string>
+</dict>
+</plist>
 """
     plist.write_text(content, encoding="utf-8")
     with contextlib.suppress(Exception):
@@ -939,55 +1130,94 @@ def schedule_status() -> Dict[str, Any]:
         return {"platform": "windows", "installed": code == 0, "detail": out or err}
     if system == "darwin":
         plist = Path.home() / "Library" / "LaunchAgents" / f"{MACOS_PLIST_LABEL}.plist"
-        return {"platform": "macos", "installed": plist.exists(), "detail": str(plist)}
+        uid = os.getuid() if hasattr(os, "getuid") else None
+        service = f"gui/{uid}/{MACOS_PLIST_LABEL}" if uid is not None else MACOS_PLIST_LABEL
+        code, out, err = run_cmd(["launchctl", "print", service], timeout=30)
+        return {"platform": "macos", "installed": code == 0, "plist_exists": plist.exists(), "detail": out or err or str(plist)}
     code, out, err = run_cmd(["crontab", "-l"], timeout=30)
     return {"platform": "linux", "installed": code == 0 and CRON_BEGIN in out and CRON_END in out, "detail": out if code == 0 else err}
 
 
 def command_setup(args: argparse.Namespace, p: AppPaths, logger: logging.Logger) -> int:
+    global RUNTIME_MASTER_TOKEN
     if not args.skip_dependency_check:
-        ensure_dependencies(logger, auto_install=args.yes or yes_no("Install or repair required dependencies now?", True))
+        ensure_dependencies(
+            logger,
+            auto_install=args.yes or yes_no(
+                "Install or repair required dependencies now? This installs gpsoauth and Playwright Chromium if missing.",
+                True,
+            ),
+        )
+
     cfg = load_config(p)
     cfg.android_id = cfg.android_id or get_or_create_android_id(p)
-    cfg.email = args.email or input("Google Home owner's email: ").strip()
+    cfg.email = args.email or prompt_text("Google Home owner email. Use the account that owns/administers the Nest WiFi network")
     if not cfg.email:
         raise ConfigError("Email is required.")
+
     cfg.ssid_at_setup = args.ssid or current_wifi_ssid()
-    logger.info("Current WiFi SSID: %s", cfg.ssid_at_setup or "(not detected)")
-    oauth_token = input("oauth_token: ").strip() if args.manual_cookie else browser_get_oauth_cookie(p, logger, args.browser_timeout)
+    logger.info("Current WiFi SSID detected for safety checks: %s", cfg.ssid_at_setup or "(not detected)")
+    if not cfg.ssid_at_setup:
+        logger.warning("SSID was not detected. Scheduled safety checks may fail closed until setup is run from WiFi or --ssid is supplied.")
+
+    oauth_token = input("Paste oauth_token from browser login: ").strip() if args.manual_cookie else browser_get_oauth_cookie(p, logger, args.browser_timeout)
     logger.info("Exchanging oauth_token for master token.")
-    cfg.master_token = exchange_cookie_for_master_token(cfg.email, oauth_token, cfg.android_id)
+    master_token = exchange_cookie_for_master_token(cfg.email, oauth_token, cfg.android_id, logger=logger)
+    RUNTIME_MASTER_TOKEN = master_token
+
+    print("\n" + token_storage_warning(p.config_path) + "\n")
+    save_token = args.save_token if args.save_token is not None else (True if args.yes else yes_no("Save the token to config.json for unattended scheduled reboots?", False))
+    if save_token:
+        cfg.master_token = master_token
+        logger.warning("Token will be saved to config.json. Keep the script folder private and hidden where practical.")
+    else:
+        cfg.master_token = ""
+        cfg.schedule_installed = False
+        logger.warning("Token was not saved. This setup will not support unattended scheduled runs. Next script start will require setup again.")
+
     system_id = args.system_id
     system_name = None
+    discovery_cfg = AppConfig(**{**cfg.to_dict(), "master_token": master_token})
     if not system_id and not args.no_discover:
-        logger.info("Attempting network autodiscovery.")
-        system_id, system_name, candidates = discover_system_id(cfg, cfg.ssid_at_setup, logger=logger)
+        logger.info("Attempting network autodiscovery using the signed-in Google Home account.")
+        system_id, system_name, candidates = discover_system_id(discovery_cfg, cfg.ssid_at_setup, logger=logger)
         cfg.discovery_candidate_count = len(candidates)
         if not system_id and candidates:
             system_id, system_name = choose_candidate(candidates)
     if not system_id:
-        system_id = input("Enter WiFi network/group system_id: ").strip()
+        system_id = prompt_text("Enter WiFi network/group system_id manually. Leave blank only if you want to cancel setup")
     if not system_id:
         raise ConfigError("system_id is required.")
     cfg.system_id = system_id
     cfg.system_name = system_name or cfg.system_name
+
     if args.enable_speedtests is not None:
         cfg.speedtests_enabled = args.enable_speedtests
     elif args.yes:
         cfg.speedtests_enabled = False
     else:
-        cfg.speedtests_enabled = yes_no("Run Google/Nest speed tests before and after scheduled reboots?", False)
+        cfg.speedtests_enabled = yes_no(
+            "Enable experimental Google/Nest native speed tests before/after reboot? This uses private API behaviour and may not work on all networks.",
+            False,
+        )
     if cfg.speedtests_enabled:
-        cfg.pre_reboot_speedtest_enabled = True if args.yes else yes_no("Run pre-reboot speed test for baseline logging?", True)
-        cfg.post_reboot_speedtest_enabled = True if args.yes else yes_no("Run post-reboot speed test after recovery?", True)
+        cfg.pre_reboot_speedtest_enabled = True if args.yes else yes_no("Run a pre-reboot speed test to record a baseline before restarting the network?", True)
+        cfg.post_reboot_speedtest_enabled = True if args.yes else yes_no("Run a post-reboot speed test after the network has recovered?", True)
         if cfg.post_reboot_speedtest_enabled and not args.yes:
-            val = input(f"Post-reboot stabilisation delay seconds [{cfg.speedtest_stabilisation_seconds}]: ").strip()
+            val = prompt_text(f"Post-reboot stabilisation delay in seconds before speed test", str(cfg.speedtest_stabilisation_seconds))
             if val:
                 cfg.speedtest_stabilisation_seconds = max(0, int(val))
+
     save_config(p, cfg)
     logger.info("Config saved: %s", p.config_path)
     logger.info("Log file: %s", p.log_path)
-    install_sched = args.install_schedule if args.install_schedule is not None else (True if args.yes else yes_no("Create or update daily scheduled reboot now?", True))
+
+    if not save_token:
+        logger.info("Skipping schedule setup because the token was not saved. Scheduled runs require a saved token.")
+        install_sched = False
+    else:
+        install_sched = args.install_schedule if args.install_schedule is not None else (True if args.yes else yes_no("Create or update a daily unattended scheduled reboot now?", True))
+
     if install_sched:
         t = args.schedule_time or (cfg.schedule_time if args.yes else prompt_time(cfg.schedule_time))
         install_schedule(p, t, logger)
@@ -997,14 +1227,22 @@ def command_setup(args: argparse.Namespace, p: AppPaths, logger: logging.Logger)
         save_config(p, cfg)
         if not cfg.schedule_installed:
             logger.warning("Schedule command completed but OS schedule status did not confirm installation.")
+        logger.info("Scheduled run installed. Do not move or rename this script or its folder unless you reinstall the schedule.")
+
     logger.info("Setup complete.")
+    run_after_setup = getattr(args, "run_after_setup", None)
+    if run_after_setup is None and not getattr(args, "yes", False):
+        run_after_setup = yes_no("Run the main reboot workflow now using the current setup?", False)
+    if run_after_setup:
+        reboot_args = argparse.Namespace(command="reboot", dry_run=False)
+        return command_reboot(reboot_args, p, logger)
     return 0
 
 
 def command_test(args: argparse.Namespace, p: AppPaths, logger: logging.Logger) -> int:
-    cfg = load_config(p)
+    cfg = apply_runtime_token_if_present(load_config(p))
     cfg.validate_for_run()
-    _ = get_access_token(cfg)
+    _ = get_access_token(cfg, logger=logger)
     logger.info("Auth OK. Current SSID=%s system_id=%s", current_wifi_ssid() or "(not detected)", cfg.system_id)
     if args.discover:
         print(json.dumps(discover_system_id(cfg, current_wifi_ssid(), logger=logger)[2], indent=2))
@@ -1012,9 +1250,9 @@ def command_test(args: argparse.Namespace, p: AppPaths, logger: logging.Logger) 
 
 
 def command_speedtest(args: argparse.Namespace, p: AppPaths, logger: logging.Logger) -> int:
-    cfg = load_config(p)
+    cfg = apply_runtime_token_if_present(load_config(p))
     cfg.validate_for_run()
-    if args.dry_run or dry_run_enabled():
+    if is_dry_run(args):
         logger.info("Dry run enabled. No speed test API call will be sent.")
         return 0
     result = run_native_speedtest(cfg, args.phase, p, logger)
@@ -1029,17 +1267,20 @@ def command_speedtest(args: argparse.Namespace, p: AppPaths, logger: logging.Log
 
 def command_reboot(args: argparse.Namespace, p: AppPaths, logger: logging.Logger) -> int:
     workflow_start = monotonic()
-    run_summary: Dict[str, Any] = {"started_at": now_iso(), "version": SCRIPT_VERSION, "dry_run": bool(args.dry_run or dry_run_enabled())}
+    run_summary: Dict[str, Any] = {"started_at": now_iso(), "version": SCRIPT_VERSION, "dry_run": is_dry_run(args)}
     with single_instance_lock(p, logger):
-        cfg = load_config(p)
+        cfg = apply_runtime_token_if_present(load_config(p))
         cfg.validate_for_run()
         ssid = current_wifi_ssid()
-        if cfg.verify_current_ssid_on_reboot and cfg.ssid_at_setup and ssid and not ssid_equal(ssid, cfg.ssid_at_setup):
-            raise ConfigError(f"Safety stop: current SSID '{ssid}' != setup SSID '{cfg.ssid_at_setup}'.")
-        logger.info("Starting reboot workflow. Version=%s DryRun=%s", SCRIPT_VERSION, args.dry_run or dry_run_enabled())
+        if cfg.verify_current_ssid_on_reboot and cfg.ssid_at_setup:
+            if not ssid:
+                raise ConfigError("Safety stop: current WiFi SSID could not be detected. Run setup from the target WiFi network or disable SSID verification only if you understand the risk.")
+            if not ssid_equal(ssid, cfg.ssid_at_setup):
+                raise ConfigError(f"Safety stop: current SSID '{ssid}' != setup SSID '{cfg.ssid_at_setup}'.")
+        logger.info("Starting reboot workflow. Version=%s DryRun=%s", SCRIPT_VERSION, is_dry_run(args))
         logger.info("Network=%s CurrentSSID=%s", cfg.system_name or cfg.system_id, ssid or "(not detected)")
         logger.info("Config=%s Log=%s SpeedHistory=%s", p.config_path, p.log_path, p.speedtest_history_path)
-        if args.dry_run or dry_run_enabled():
+        if is_dry_run(args):
             logger.info("Dry run enabled. No Google API call will be sent.")
             run_summary.update({"completed_at": now_iso(), "success": True, "total_duration_seconds": elapsed(workflow_start)})
             append_jsonl(p.run_history_path, run_summary)
@@ -1061,11 +1302,34 @@ def command_reboot(args: argparse.Namespace, p: AppPaths, logger: logging.Logger
             raise ApiError(f"Reboot request failed: HTTP {status}: {text[:500]}")
         logger.info("Reboot request accepted. API latency=%ss", request_latency)
         if cfg.wait_after_reboot:
-            time.sleep(max(0, cfg.initial_reboot_delay_seconds))
+            countdown_sleep(max(0, cfg.initial_reboot_delay_seconds), logger, "Initial reboot delay before checking network recovery")
             recovered, checks, recovery_duration = wait_for_network_recovery(logger, cfg.wait_timeout_seconds, cfg.wait_interval_seconds)
             run_summary.update({"network_recovered": recovered, "network_recovery_checks": checks, "network_recovery_duration_seconds": recovery_duration})
             if recovered:
                 logger.info("Network recovery confirmed after %ss.", recovery_duration)
+            if cfg.verify_current_ssid_on_reboot and cfg.ssid_at_setup:
+                recovered_ssid = current_wifi_ssid()
+                if not recovered_ssid:
+                    run_summary.update({
+                        "completed_at": now_iso(),
+                        "success": False,
+                        "error": "SSID unknown after recovery",
+                        "expected_ssid": cfg.ssid_at_setup,
+                        "total_duration_seconds": elapsed(workflow_start),
+                    })
+                    append_jsonl(p.run_history_path, run_summary)
+                    raise ConfigError("Recovery safety stop: current WiFi SSID could not be detected after recovery.")
+                if not ssid_equal(recovered_ssid, cfg.ssid_at_setup):
+                    run_summary.update({
+                        "completed_at": now_iso(),
+                        "success": False,
+                        "error": "SSID mismatch after recovery",
+                        "recovered_ssid": recovered_ssid,
+                        "expected_ssid": cfg.ssid_at_setup,
+                        "total_duration_seconds": elapsed(workflow_start),
+                    })
+                    append_jsonl(p.run_history_path, run_summary)
+                    raise ConfigError(f"Recovery safety stop: current SSID '{recovered_ssid}' != setup SSID '{cfg.ssid_at_setup}'.")
             if cfg.speedtests_enabled and cfg.post_reboot_speedtest_enabled:
                 delay = max(0, cfg.speedtest_stabilisation_seconds)
                 if delay:
@@ -1096,8 +1360,8 @@ def command_status(args: argparse.Namespace, p: AppPaths, logger: logging.Logger
         "speedtest_history_path": str(p.speedtest_history_path),
         "run_history_path": str(p.run_history_path),
         "configured": all([cfg.email, cfg.master_token, cfg.android_id, cfg.system_id]),
-        "email": cfg.email,
-        "system_id": cfg.system_id,
+        "email": cfg.email if getattr(args, "full", False) else redact(cfg.email),
+        "system_id": cfg.system_id if getattr(args, "full", False) else (cfg.system_id[:4] + "..." if cfg.system_id else ""),
         "system_name": cfg.system_name,
         "ssid_at_setup": cfg.ssid_at_setup,
         "current_ssid_now": current_wifi_ssid(),
@@ -1160,6 +1424,7 @@ def command_self_test(args, p, logger):
     assert parsed and parsed.download_mbps == 842.5 and parsed.upload_mbps == 47.2 and parsed.ping_ms == 12
     assert remove_marked(f"a\n{CRON_BEGIN}\nb\n{CRON_END}\nc\n") == "a\nc\n"
     assert ssid_equal(" HomeWiFi ", "homewifi")
+    assert "scheduled reboots" in token_storage_warning(Path("config.json"))
     assert not process_exists(-1)
     logger.info("Self-test OK.")
     return 0
@@ -1186,33 +1451,58 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--no-install-schedule", dest="install_schedule", action="store_false")
     s.set_defaults(install_schedule=None)
     s.add_argument("--schedule-time")
+    s.add_argument("--save-token", dest="save_token", action="store_true")
+    s.add_argument("--no-save-token", dest="save_token", action="store_false")
+    s.set_defaults(save_token=None)
+    s.add_argument("--run-after-setup", dest="run_after_setup", action="store_true")
+    s.add_argument("--no-run-after-setup", dest="run_after_setup", action="store_false")
+    s.set_defaults(run_after_setup=None)
     s.set_defaults(func=command_setup)
     t = sub.add_parser("test")
     t.add_argument("--discover", action="store_true")
     t.set_defaults(func=command_test)
     sp = sub.add_parser("speedtest")
     sp.add_argument("--phase", choices=["manual", "pre-reboot", "post-reboot"], default="manual")
+    sp.add_argument("--dry-run", action="store_true")
     sp.set_defaults(func=command_speedtest)
-    sub.add_parser("reboot").set_defaults(func=command_reboot)
+    rb = sub.add_parser("reboot")
+    rb.add_argument("--dry-run", action="store_true")
+    rb.set_defaults(func=command_reboot)
     sub.add_parser("install-deps").set_defaults(func=command_install_deps)
     isch = sub.add_parser("install-schedule")
     isch.add_argument("--time")
     isch.set_defaults(func=command_install_schedule)
     sub.add_parser("uninstall-schedule").set_defaults(func=command_uninstall_schedule)
     sub.add_parser("schedule-status").set_defaults(func=command_schedule_status)
-    sub.add_parser("status").set_defaults(func=command_status)
+    st = sub.add_parser("status")
+    st.add_argument("--full", action="store_true")
+    st.set_defaults(func=command_status)
     sub.add_parser("self-test").set_defaults(func=command_self_test)
     return parser
 
 
 def main(argv: Optional[List[str]] = None) -> int:
+    print_logo()
     p = resolve_paths()
     parser = build_parser()
     args = parser.parse_args(argv)
     logger = setup_logging(p, getattr(args, "verbose", False))
+
+    # No command means scheduled/default use. If setup is incomplete, offer setup instead of failing.
     if not getattr(args, "command", None):
+        cfg = load_config(p)
+        try:
+            cfg.validate_for_run()
+        except ConfigError as exc:
+            logger.warning("Setup is not complete: %s", exc)
+            if yes_no("Setup has not been completed. Run setup now?", True):
+                setup_args = parser.parse_args(["setup"])
+                return int(command_setup(setup_args, p, logger))
+            logger.info("Setup was not run. Exiting without error.")
+            return 0
         args.command = "reboot"
         args.func = command_reboot
+
     try:
         return int(args.func(args, p, logger))
     except NestRebooterError as exc:
