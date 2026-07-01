@@ -1,149 +1,202 @@
-# Nest-Rebooter (Portable Edition)
+# Nest Rebooter (Portable)
 
-**Automated scheduled restart for Google Nest WiFi / Google WiFi — cross-platform, single-file implementation.**
+Automated scheduled restart for Google Nest WiFi / Google WiFi using a single cross-platform Python script.
 
 ---
 
 ## Credit
 
-This project is based on the original work by:
+Based on the original project:
 
-**joep1000 / nest-rebooter**  
+joep1000 / nest-rebooter  
 https://github.com/joep1000/nest-rebooter
 
-The core concept, API method, and authentication approach originate from that project.  
-This version is a complete rewrite focused on portability, simplicity, and production reliability.
+The core API interaction and authentication model originate from that implementation.  
+This version is a complete rewrite focused on portability, usability, and operational reliability.
 
 ---
 
 ## Overview
 
-This script automates the restart of a Google Nest WiFi / Google WiFi network by calling the same Google cloud API used by the Google Home application.
+`nest_rebooter_portable.py` is a single-file Python script that automates restarting a Google Nest WiFi or Google WiFi network using Google's backend API.
 
-It is implemented as a **single Python file** and runs on:
+It is designed for unattended execution and runs on:
 
 - Windows
 - macOS
 - Linux
 
-The script is designed to run unattended via the native scheduler of each operating system.
+No services, daemons, or background processes are required.
 
 ---
 
 ## Problem
 
-Google Nest WiFi and Google WiFi systems are known to degrade in performance over time:
+Nest WiFi and Google WiFi networks often degrade over time:
 
-- Throughput drops after 1–3 days
-- Latency and consistency degrade
-- Recovery typically requires manual restart
+- Reduced throughput after extended uptime
+- Increased latency and instability
+- Mesh performance degradation
 
-There is no native scheduling feature provided by Google.
-
-This script provides a reliable automated workaround.
+A manual reboot resolves this, but Google does not provide scheduling.
 
 ---
 
-## Functionality
+## Solution
 
-- Performs a full network restart (router and all access points)
-- Uses official Google Home backend infrastructure
-- Requires one-time authentication
-- Runs unattended on a schedule
-- Includes safety checks and logging
-- Requires no additional services or background processes
+This script enables:
+
+- Reliable automated network reboot
+- Single-file deployment
+- Cross-platform scheduling
+- No ongoing user interaction
 
 ---
 
-## Key Adjustments
+## Core Functionality
 
-| Area | Original | Portable Version |
-|------|----------|----------------|
-| Platform | Linux-focused | Cross-platform |
-| Installation | Bash installer | Single Python file |
-| Scheduling | systemd | Native OS schedulers |
-| Setup | Manual cookie extraction | Automated browser login |
-| File layout | Multiple files | Self-contained |
-| Logging | System directories | Local file |
-| Execution | Requires arguments | Runs with no arguments |
-| Reliability | Basic | Locking, validation, atomic writes |
-| Safety | Minimal | SSID verification, dry-run |
+- Full network restart (router and access points)
+- Uses Google Home backend API
+- One-time authentication
+- Unattended scheduled execution
+- Local logging and history tracking
+
+---
+
+## Key Features (v3.1.3)
+
+### Execution
+
+- No arguments required for normal operation
+- Safe for direct use in schedulers
+- Built-in CLI for setup, testing, and diagnostics
+
+### Reliability
+
+- PID-based lock file (prevents concurrent runs)
+- HTTP retry with exponential backoff
+- Authentication retry handling
+- Access token caching per run
+- Atomic configuration writes
+
+### Safety
+
+- SSID validation before reboot
+- Failure if SSID cannot be determined
+- Dry-run support
+- Token redaction in logs
+
+### User Experience
+
+- Clear setup prompts with context
+- Progress output for long-running operations
+- Countdown timers for waits and delays
+- ASCII startup banner
+
+### Scheduling
+
+- Native OS scheduler integration:
+  - Windows Task Scheduler
+  - macOS launchd
+  - Linux cron
+- Scheduler status reflects actual OS state
+
+### Optional Features
+
+- Experimental Google/Nest speed test integration
+- Pre and post reboot performance logging
 
 ---
 
 ## How It Works
 
-The script uses the same backend API used by the Google Home app.
-
-### Flow
-
 ```
-User login (browser)
+Browser login
     ↓
-OAuth cookie (oauth_token)
+oauth_token
     ↓
 gpsoauth.exchange_token()
     ↓
-Master token (stored locally)
+Master token
     ↓
 gpsoauth.perform_oauth()
     ↓
-Access token (generated per run)
+Access token
     ↓
-Google Home API
-    ↓
-Network reboot
-```
-
-### API Endpoint
-
-```
-POST https://googlehomefoyer-pa.googleapis.com/v2/groups/{system_id}/reboot
+POST /v2/groups/{system_id}/reboot
 ```
 
 ---
 
 ## Requirements
 
-- Python 3.8 or newer
-- Google account that **owns the WiFi network**
+- Python 3.8+
 - Internet connection
-- Local browser (for initial setup only)
+- Google account that owns the network
+- Local browser (setup only)
 
 ---
 
 ## Installation
 
-Install required dependencies:
+Run:
 
 ```bash
-pip install gpsoauth playwright
-python -m playwright install chromium
+python nest_rebooter_portable.py
 ```
-
-No further installation is required.
-
----
 
 ## Setup
 
-Run once:
+Run:
 
 ```bash
-python nest_rebooter_portable_v3.py setup
+python nest_rebooter_portable.py
 ```
 
-### Setup Process
+### Setup Flow
 
-1. A browser window opens automatically
-2. Log in with your Google Home account
-3. Script captures authentication token
-4. Script attempts to identify your network
-5. Configuration is saved locally
+1. Dependencies installed (if required)
+2. Browser opens for Google login
+3. Authentication token captured automatically
+4. Network autodiscovery attempted
+5. Configuration written locally
 
-### Files Created
+---
 
-All files are stored in the same directory as the script:
+## Token Storage
+
+During setup you will be prompted to save the authentication token.
+
+### If saved
+
+- Required for scheduled unattended execution
+- Stored in `config.json`
+
+### If not saved
+
+- Script works for current run only
+- Cannot be scheduled
+- Setup must be repeated on next run
+
+---
+
+## Security Considerations
+
+- No password is stored
+- A long-lived token may be stored in `config.json`
+- Anyone with access to the script folder could potentially reuse the token
+
+Recommended:
+
+- Keep the script directory private
+- Do not commit to version control
+- Do not share config or log files
+
+---
+
+## Files Created
+
+All files are stored alongside the script:
 
 ```
 config.json
@@ -151,70 +204,45 @@ nest-rebooter.log
 nest-rebooter.lock
 android_id.txt
 browser-profile/
+speedtest-history.jsonl (optional)
+run-history.jsonl (optional)
 ```
 
 ---
 
 ## Usage
 
-### Normal execution
+### Default (reboot)
 
 ```bash
-python nest_rebooter_portable_v3.py
+python nest_rebooter_portable.py
 ```
-
-- No arguments required
-- Default behaviour is a network reboot
-
----
-
-### Test without reboot
-
-```bash
-python nest_rebooter_portable_v3.py test
-```
-
----
-
-### View status
-
-```bash
-python nest_rebooter_portable_v3.py status
-```
-
----
-
-### Dry run
-
-```bash
-NEST_REBOOTER_DRY_RUN=1 python nest_rebooter_portable_v3.py
-```
-
-No network action is performed.
 
 ---
 
 ## Scheduling
 
-### Windows (Task Scheduler)
+The script runs without arguments and is safe to execute directly.
+
+---
+
+### Windows
 
 **Program:**
 
-```text
+```
 py
 ```
 
 **Arguments:**
 
-```text
-"C:\path\to\nest_rebooter_portable_v3.py"
 ```
-
-No additional parameters required.
+"C:\path\to\nest_rebooter_portable.py"
+```
 
 ---
 
-### Linux (cron)
+### Linux
 
 ```bash
 crontab -e
@@ -223,62 +251,222 @@ crontab -e
 Example:
 
 ```bash
-0 3 * * * /usr/bin/python3 /path/nest_rebooter_portable_v3.py
+0 3 * * * /usr/bin/python3 /path/nest_rebooter_portable.py
 ```
 
 ---
 
-### macOS (cron or launchd)
+### macOS
 
-Simple cron example:
+Automatically configured via launchd during setup.
+
+Manual cron alternative:
 
 ```bash
-0 3 * * * /usr/bin/python3 /path/nest_rebooter_portable_v3.py
+0 3 * * * /usr/bin/python3 /path/nest_rebooter_portable.py
 ```
 
 ---
 
-## Safety Features
+## Safety Model
 
-- Ensures only one instance runs at a time
-- Optional check to confirm correct WiFi network before reboot
-- Dry-run capability for testing
-- Secure log output (tokens are redacted)
-- Atomic configuration writes to prevent corruption
+| Scenario | Behaviour |
+|--------|----------|
+| Wrong SSID detected | Execution stops |
+| SSID cannot be detected | Execution stops |
+| Multiple instances | Blocked by lock file |
+| Network not recovered | Logged with warning |
+| API failure | Retry with backoff |
 
 ---
 
-## Security Considerations
+## Behaviour Notes
 
-- The script does not store your Google password
-- A long-lived authentication token is stored locally
-- Protect the script directory with appropriate filesystem permissions
+- The script intentionally fails closed when network identity cannot be verified
+- This prevents rebooting unintended networks
+- Scheduled execution assumes a stable environment (same machine, same network)
+
+---
+
+## Advanced Usage
+
+### Test authentication
+
+```bash
+python nest_rebooter_portable.py test
+```
+
+---
+
+### Status
+
+```bash
+python nest_rebooter_portable.py status
+```
+
+Full output:
+
+```bash
+python nest_rebooter_portable.py status --full
+```
+
+---
+
+### Speed test
+
+```bash
+python nest_rebooter_portable.py speedtest
+```
+
+Options:
+
+```bash
+--phase manual
+--phase pre-reboot
+--phase post-reboot
+```
+
+---
+
+### Install dependencies
+
+```bash
+python nest_rebooter_portable.py install-deps
+```
+
+---
+
+### Dry run
+
+```bash
+NEST_REBOOTER_DRY_RUN=1 python nest_rebooter_portable.py
+```
+
+No reboot request will be sent.
+
+---
+
+### Skip dependency check
+
+```bash
+--skip-dependency-check
+```
+
+---
+
+### Disable autodiscovery
+
+```bash
+--no-discover
+```
+
+---
+
+### Manual token input
+
+```bash
+--manual-cookie
+```
+
+---
+
+### Set schedule during setup
+
+```bash
+--schedule-time HH:MM
+```
+
+---
+
+### Token storage flags
+
+```bash
+--save-token
+--no-save-token
+```
+
+---
+
+## Logging
+
+Primary log file:
+
+```
+nest-rebooter.log
+```
+
+Includes:
+
+- execution flow
+- retry events
+- network checks
+- API responses
+
+Sensitive values are automatically redacted.
 
 ---
 
 ## Limitations
 
 - Uses an undocumented Google API
-- May break if Google changes backend behaviour
-- Requires initial browser authentication
-- Autodiscovery may require manual confirmation in some cases
+- Behaviour may change without notice
+- Requires browser login during setup
+- Speed test functionality is not guaranteed
+
+---
+
+## Troubleshooting
+
+### Script appears inactive
+
+The script logs progress during:
+
+- dependency installation
+- browser login wait
+- network recovery checks
+- reboot delays
+
+Check the log file for activity.
+
+---
+
+### SSID not detected
+
+- Ensure system is connected via WiFi
+- Run setup again from the target network
+- Provide SSID manually if required
+
+---
+
+### Scheduler not running
+
+Validate:
+
+```bash
+python nest_rebooter_portable.py schedule-status
+```
 
 ---
 
 ## Summary
 
-This version provides:
+This implementation provides:
 
-- A portable implementation of the original concept
-- Reliable unattended execution across all operating systems
-- Simplified setup and operation
-- Production-grade safeguards for long-term use
+- A portable, single-file solution
+- Reliable unattended scheduled execution
+- Strict safety controls
+- Clear operational visibility
+
+It is suitable for long-term automated operation in a controlled environment.
 
 ---
 
-If further extension is required, this architecture supports:
+## Extendability
 
-- Post-reboot validation (speed test)
-- Multi-network support
-- Notification integrations
-- Packaging as a standalone executable
+The current architecture supports:
+
+- Multi-network management
+- External alerting (email, webhook)
+- Performance tracking integrations
+- Packaging into standalone executable
+```
